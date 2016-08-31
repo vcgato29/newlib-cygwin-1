@@ -239,6 +239,12 @@ dlopen (const char *name, int flags)
 	     not use the LD_LIBRARY_PATH environment variable. */
 	  finder.add_envsearchpath ("LD_LIBRARY_PATH");
 
+	  /* Search the current executable's directory like
+	     the Windows loader does for linked dlls. */
+	  int exedirlen = get_exedir (cpath, wpath);
+	  if (exedirlen)
+	    finder.add_searchdir (cpath, exedirlen);
+
 	  /* Finally we better have some fallback. */
 	  finder.add_searchdir ("/usr/bin", 8);
 	  finder.add_searchdir ("/usr/lib", 8);
