@@ -110,7 +110,7 @@ spot_basename (const char * &basename, int &baselen, const char * name)
 
 /* Setup basenames using basename and baselen,
    return true if basenames do have some suffix. */
-static void
+static bool
 collect_basenames (pathfinder::basenamelist & basenames,
 		   const char * basename, int baselen)
 {
@@ -152,6 +152,97 @@ collect_basenames (pathfinder::basenamelist & basenames,
     }
   /* ... using original basename with new suffix. */
   basenames.appendv (basename, baselen, ext, extlen, NULL);
+
+  return !!suffix;
+}
+
+/* Return module handle if one of the basenames is already loaded. */
+static void *
+find_loaded_basename (pathfinder::basenamelist & basenames,
+		      bool have_suffix, DWORD gmheflags)
+{
+  void * ret = NULL;
+  for (pathfinder::basenamelist::buffer_iterator bn (basenames.begin ());
+       bn != basenames.end ();
+       ++bn)
+    {
+      char * dot = bn->buffer () + bn->stringlength ();
+      if (!have_suffix)
+	*dot = '.'; /* do not add the ".dll" suffix */
+      GetModuleHandleExA (gmheflags, bn->buffer (), (HMODULE *) &ret);
+      if (!have_suffix)
+	*dot = '\0'; /* restore */
+      if (ret)
+	{
+	  debug_printf ("at %p: %s", ret, bn->string ());
+	  break;
+	}
+      debug_printf ("not loaded: %s", bn->string ());
+    }
+  return ret;
+}
+
+/* Return module handle if one of the basenames (registered in finder) is
+   already loaded from within one of the searchdirs (registered in finder). */
+static void *
+find_loaded_fullname (pathfinder & finder, bool have_suffix, DWORD gmheflags,
+		      path_conv & real_filename, PWCHAR wpathbuf)
+{
+  void * ret = NULL;
+
+  struct loaded
+    : public pathfinder::simple_criterion_interface
+  {
+    virtual char const * name () const { return "loaded"; }
+
+    bool        have_suffix_;
+    DWORD       gmheflags_;
+    path_conv & real_filename_;
+    PWCHAR      wpathbuf_;
+    void *    & ret_;
+
+    loaded (bool have_suffix, DWORD gmheflags,
+	    path_conv & real_filename, PWCHAR wpathbuf,
+	    void * & ret)
+      : pathfinder::simple_criterion_interface ()
+      , have_suffix_ (have_suffix)
+      , gmheflags_ (gmheflags)
+      , real_filename_ (real_filename)
+      , wpathbuf_ (wpathbuf)
+      , ret_ (ret)
+    {}
+
+    /* pathfinder::simple_criterion_interface
+
+       Returns true and provides real_filename & module handle
+       if the filename searched by pathfinder is already loaded
+       either as the very filename or as the resolved symlink. */
+    virtual bool test (const char * filename) const
+    {
+      /* First, check if we loaded the unresolved symlink's name: */
+      int symflag = PC_POSIX;
+
+      for (int i = 0; !ret_ && i < 2; ++i)
+	{
+	  real_filename_.check (filename, symflag);
+	  PWCHAR wpath = real_filename_.get_wide_win32_path (wpathbuf_);
+	  if (!wpath)
+	    return false;
+	  if (!have_suffix_)
+	    wcscat (wpath, L"."); /* do not search with a ".dll" suffix */
+	  GetModuleHandleExW (gmheflags_, wpath, (HMODULE *) &ret_);
+	  if (!real_filename_.issymlink ())
+	    break; /* done if no symlink */
+	  /* Second, check if we loaded the resolved symlink's name: */
+	  symflag |= PC_SYM_FOLLOW;
+	}
+      return !!ret_;
+    }
+  };
+
+  finder.find (loaded (have_suffix, gmheflags, real_filename, wpathbuf, ret));
+
+  return ret;
 }
 
 /* Identify dir of current executable into exedirbuf using wpathbuf buffer.
@@ -205,7 +296,15 @@ dlopen (const char *name, int flags)
       const char *basename;
       int baselen;
       bool have_dir = spot_basename (basename, baselen, name);
-      collect_basenames (basenames, basename, baselen);
+      bool have_suffix = collect_basenames (basenames, basename, baselen);
+
+      if (!have_dir)
+	{
+	  /* search for loaded module without any searchdirs */
+	  ret = find_loaded_basename (basenames, have_suffix, gmheflags);
+	  if (ret || (flags & RTLD_NOLOAD))
+	    break;
+	}
 
       /* handle for the named library */
       path_conv real_filename;
@@ -232,6 +331,13 @@ dlopen (const char *name, int flags)
 
 	  /* search the specified dir */
 	  finder.add_searchdir (name, dirlen);
+
+	  /* search for loaded module in the identified searchdirs */
+	  ret = find_loaded_fullname (finder, have_suffix, gmheflags,
+				      real_filename, wpath);
+
+	  if (ret || (flags & RTLD_NOLOAD))
+	    break;
 	}
       else
 	{
