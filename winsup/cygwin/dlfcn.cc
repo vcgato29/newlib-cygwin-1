@@ -245,6 +245,10 @@ dlopen (const char *name, int flags)
 	  if (exedirlen)
 	    finder.add_searchdir (cpath, exedirlen);
 
+	  /* Search the PATH environment variable like
+	     the Windows loader does for linked dlls. */
+	  finder.add_envsearchpath ("PATH");
+
 	  /* Finally we better have some fallback. */
 	  finder.add_searchdir ("/usr/bin", 8);
 	  finder.add_searchdir ("/usr/lib", 8);
