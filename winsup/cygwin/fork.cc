@@ -20,6 +20,7 @@ details. */
 #include "child_info.h"
 #include "cygtls.h"
 #include "tls_pbuf.h"
+#include "shared_info.h"
 #include "dll_init.h"
 #include "cygmalloc.h"
 #include "ntdll.h"
@@ -30,8 +31,13 @@ details. */
 /* FIXME: Once things stabilize, bump up to a few minutes.  */
 #define FORK_WAIT_TIMEOUT (300 * 1000)     /* 300 seconds */
 
+static int dofork (bool *with_forkables);
 class frok
 {
+  frok (bool *forkables)
+    : with_forkables (forkables)
+  {}
+  bool *with_forkables;
   bool load_dlls;
   child_info_fork ch;
   const char *errmsg;
@@ -41,7 +47,7 @@ class frok
   int __stdcall parent (volatile char * volatile here);
   int __stdcall child (volatile char * volatile here);
   bool error (const char *fmt, ...);
-  friend int fork ();
+  friend int dofork (bool *with_forkables);
 };
 
 static void
@@ -177,21 +183,18 @@ frok::child (volatile char * volatile here)
   if (fixup_shms_after_fork ())
     api_fatal ("recreate_shm areas after fork failed");
 
-  /* If we haven't dynamically loaded any dlls, just signal
-     the parent.  Otherwise, load all the dlls, tell the parent
-      that we're done, and wait for the parent to fill in the.
-      loaded dlls' data/bss. */
+  /* load dynamic dlls, if any, re-track main-executable and cygwin1.dll */
+  dlls.load_after_fork (hParent);
+
+  cygheap->fdtab.fixup_after_fork (hParent);
+
+  /* If we haven't dynamically loaded any dlls, just signal the parent.
+     Otherwise, tell the parent that we've loaded all the dlls
+     and wait for the parent to fill in the loaded dlls' data/bss. */
   if (!load_dlls)
-    {
-      cygheap->fdtab.fixup_after_fork (hParent);
-      sync_with_parent ("performed fork fixup", false);
-    }
+    sync_with_parent ("performed fork fixup", false);
   else
-    {
-      dlls.load_after_fork (hParent);
-      cygheap->fdtab.fixup_after_fork (hParent);
-      sync_with_parent ("loaded dlls", true);
-    }
+    sync_with_parent ("loaded dlls", true);
 
   init_console_handler (myself->ctty > 0);
   ForceCloseHandle1 (fork_info->forker_finished, forker_finished);
@@ -333,8 +336,6 @@ frok::parent (volatile char * volatile stack_here)
   si.lpReserved2 = (LPBYTE) &ch;
   si.cbReserved2 = sizeof (ch);
 
-  syscall_printf ("CreateProcessW (%W, %W, 0, 0, 1, %y, 0, 0, %p, %p)",
-		  myself->progname, myself->progname, c_flags, &si, &pi);
   bool locked = __malloc_lock ();
 
   /* Remove impersonation */
@@ -343,10 +344,26 @@ frok::parent (volatile char * volatile stack_here)
   ch.refresh_cygheap ();
   ch.prefork ();	/* set up process tracking pipes. */
 
+  *with_forkables = dlls.setup_forkables (*with_forkables);
+
+  ch.silentfail (!*with_forkables); /* fail silently without forkables */
+
   while (1)
     {
+      PCWCHAR forking_progname = NULL;
+      if (dlls.main_executable)
+        forking_progname = dll_list::buffered_shortname
+			   (dlls.main_executable->forkedntname ());
+      if (!forking_progname || !*forking_progname)
+	forking_progname = myself->progname;
+
+      syscall_printf ("CreateProcessW (%W, %W, 0, 0, 1, %y, 0, 0, %p, %p)",
+		      forking_progname, myself->progname, c_flags, &si, &pi);
+
       hchild = NULL;
-      rc = CreateProcessW (myself->progname,	/* image to run */
+      /* cygwin1.dll may reuse the forking_progname buffer, even
+	 in case of failure: don't reuse forking_progname later */
+      rc = CreateProcessW (forking_progname,	/* image to run */
 			   GetCommandLineW (),	/* Take same space for command
 						   line as in parent to make
 						   sure child stack is allocated
@@ -367,6 +384,7 @@ frok::parent (volatile char * volatile stack_here)
 	{
 	  this_errno = geterrno_from_win_error ();
 	  error ("CreateProcessW failed for '%W'", myself->progname);
+	  dlls.release_forkables ();
 	  memset (&pi, 0, sizeof (pi));
 	  goto cleanup;
 	}
@@ -379,6 +397,8 @@ frok::parent (volatile char * volatile stack_here)
 
       CloseHandle (pi.hThread);
       hchild = pi.hProcess;
+
+      dlls.release_forkables ();
 
       /* Protect the handle but name it similarly to the way it will
 	 be called in subproc handling. */
@@ -462,7 +482,7 @@ frok::parent (volatile char * volatile stack_here)
       impure_beg = _impure_ptr;
       impure_end = _impure_ptr + 1;
     }
-  rc = child_copy (hchild, true,
+  rc = child_copy (hchild, true, !*with_forkables,
 		   "stack", stack_here, ch.stackbase,
 		   impure, impure_beg, impure_end,
 		   NULL);
@@ -480,7 +500,7 @@ frok::parent (volatile char * volatile stack_here)
   for (dll *d = dlls.istart (DLL_LINK); d; d = dlls.inext ())
     {
       debug_printf ("copying data/bss of a linked dll");
-      if (!child_copy (hchild, true,
+      if (!child_copy (hchild, true, !*with_forkables,
 		       "linked dll data", d->p.data_start, d->p.data_end,
 		       "linked dll bss", d->p.bss_start, d->p.bss_end,
 		       NULL))
@@ -510,7 +530,7 @@ frok::parent (volatile char * volatile stack_here)
       for (dll *d = dlls.istart (DLL_LOAD); d; d = dlls.inext ())
 	{
 	  debug_printf ("copying data/bss for a loaded dll");
-	  if (!child_copy (hchild, true,
+	  if (!child_copy (hchild, true, !*with_forkables,
 			   "loaded dll data", d->p.data_start, d->p.data_end,
 			   "loaded dll bss", d->p.bss_start, d->p.bss_end,
 			   NULL))
@@ -550,7 +570,20 @@ cleanup:
 extern "C" int
 fork ()
 {
-  frok grouped;
+  bool with_forkables = false; /* do not force hardlinks on first try */
+  int res = dofork (&with_forkables);
+  if (res >= 0)
+    return res;
+  if (with_forkables)
+    return res; /* no need for second try when already enabled */
+  with_forkables = true; /* enable hardlinks for second try */
+  return dofork (&with_forkables);
+}
+
+static int
+dofork (bool *with_forkables)
+{
+  frok grouped (with_forkables);
 
   debug_printf ("entering");
   grouped.load_dlls = 0;
@@ -623,7 +656,10 @@ fork ()
 	  strcpy (buf, "child %d - ");
 	  strcat (buf, grouped.errmsg);
 	  strcat (buf, ", errno %d");
-	  system_printf (buf, grouped.child_pid, grouped.this_errno);
+	  if (grouped.ch.silentfail ())
+	    debug_printf (buf, grouped.child_pid, grouped.this_errno);
+	  else
+	    system_printf (buf, grouped.child_pid, grouped.this_errno);
 	}
 
       set_errno (grouped.this_errno);
@@ -649,10 +685,10 @@ vfork ()
 /* Copy memory from one process to another. */
 
 bool
-child_copy (HANDLE hp, bool write, ...)
+child_copy (HANDLE hp, bool write, bool silentfail, ...)
 {
   va_list args;
-  va_start (args, write);
+  va_start (args, silentfail);
   static const char *huh[] = {"read", "write"};
 
   char *what;
@@ -678,10 +714,14 @@ child_copy (HANDLE hp, bool write, ...)
 	    {
 	      if (!res)
 		__seterrno ();
-	      /* If this happens then there is a bug in our fork
-		 implementation somewhere. */
-	      system_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
-			    what, huh[write], low, high, done, myself->dwProcessId);
+	      if (silentfail)
+		debug_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
+			     what, huh[write], low, high, done, myself->dwProcessId);
+	      else
+		/* If this happens then there is a bug in our fork
+		   implementation somewhere. */
+		system_printf ("%s %s copy failed, %p..%p, done %lu, windows pid %u, %E",
+			      what, huh[write], low, high, done, myself->dwProcessId);
 	      goto err;
 	    }
 	}
