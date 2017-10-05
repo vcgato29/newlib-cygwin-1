@@ -650,17 +650,12 @@ dofork (bool *with_forkables)
     {
       if (!grouped.errmsg)
 	syscall_printf ("fork failed - child pid %d, errno %d", grouped.child_pid, grouped.this_errno);
+      else if (grouped.ch.silentfail ())
+	debug_printf ("child %d - %s, errno %d", grouped.child_pid,
+		      grouped.errmsg, grouped.this_errno);
       else
-	{
-	  char buf[strlen (grouped.errmsg) + sizeof ("child %d - , errno 4294967295  ")];
-	  strcpy (buf, "child %d - ");
-	  strcat (buf, grouped.errmsg);
-	  strcat (buf, ", errno %d");
-	  if (grouped.ch.silentfail ())
-	    debug_printf (buf, grouped.child_pid, grouped.this_errno);
-	  else
-	    system_printf (buf, grouped.child_pid, grouped.this_errno);
-	}
+	system_printf ("child %d - %s, errno %d", grouped.child_pid,
+		       grouped.errmsg, grouped.this_errno);
 
       set_errno (grouped.this_errno);
     }
